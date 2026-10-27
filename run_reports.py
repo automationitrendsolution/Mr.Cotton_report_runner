@@ -5,8 +5,9 @@ Amazon emails each report to its configured recipients once it finishes, so noth
 Flow: open the reporting page -> sign in if needed (email -> password -> OTP only if Amazon asks) ->
 find the report's row -> Actions (the row's menu) -> Run.
 
-Which report: the data is in UTC, so from 12:30 IST until midnight "Mr.cotton today" is run, and from
-midnight until 12:30 IST "Mr.cotton yesterday" (TODAY_FROM_IST in .env; override with --report).
+Which report: both "Mr.cotton today" and "Mr.cotton yesterday" by default. With --report auto, only one is
+run, picked by the time: from 12:30 IST until midnight "today", from midnight until 12:30 IST "yesterday"
+(TODAY_FROM_IST in .env).
 
 OTP is avoided by keeping a persistent browser profile (browser_profile/) with "Keep me signed in" and
 "Don't require OTP on this browser" ticked, so Amazon trusts the device after the first sign-in.
@@ -16,8 +17,8 @@ If Amazon still asks for a code:
   - otherwise (cron) the run fails with a screenshot - sign in once with `uv run run_reports.py --headed`.
 
 Usage:
-  uv run run_reports.py               # run today's or yesterday's report by the IST time (headless)
-  uv run run_reports.py --report both # run both
+  uv run run_reports.py               # run both reports (headless)
+  uv run run_reports.py --report auto # run today's or yesterday's report by the IST time
   uv run run_reports.py --headed      # visible browser, e.g. for the first sign-in
   uv run run_reports.py --dry-run     # open each report's menu and check "Run" is there, without clicking it
 """
@@ -46,7 +47,7 @@ TOTP_SECRET = os.getenv("AMAZON_ADS_TOTP_SECRET", "").replace(" ", "")
 REPORTING_URL = os.getenv(
     "REPORTING_URL", "https://advertising.amazon.com/reporting?entityId=ENTITY1YST5GXMAIR36"
 )
-# Report data is in UTC. From TODAY_FROM_IST until midnight IST the "today" report is run, before it "yesterday".
+# With --report auto: from TODAY_FROM_IST until midnight IST the "today" report is run, before it "yesterday".
 REPORTS = {
     "today": ("Mr.cotton today", os.getenv("TODAY_REPORT_ID", "cbaf9b24-4e76-4ab5-805d-3a48d930fa5d")),
     "yesterday": ("Mr.cotton yesterday", os.getenv("YESTERDAY_REPORT_ID", "d66eeaf9-671b-4c4b-aa1a-b76931c5c9a2")),
@@ -58,6 +59,8 @@ LOG_DIR = BASE_DIR / "logs"
 
 SIGN_IN_TIMEOUT_SECONDS = 300
 NAV_TIMEOUT_MS = 60_000
+RETRIES = int(os.getenv("RETRIES", "2"))        # extra attempts after a failure (slow page, network blip)
+RETRY_DELAY_SECONDS = 15
 
 _EMAIL = ("#ap_email_login", "#ap_email", "input[name='email']")
 _CONTINUE = ("input#continue", "#continue input", "#continue")
@@ -110,10 +113,23 @@ def _on_reporting_page(page: Page) -> bool:
         return False
 
 
+def _tick(checkbox: Locator) -> None:
+    """Ticks an optional checkbox; failing to tick it must not block the sign-in step."""
+    try:
+        if checkbox.count() and not checkbox.is_checked():
+            checkbox.check(timeout=5000)
+    except PlaywrightError as exc:
+        logger.debug("Could not tick checkbox (%s)", exc)
+
+
 def _otp_code() -> str:
     if TOTP_SECRET:
         logger.info("OTP requested - generating it from AMAZON_ADS_TOTP_SECRET")
-        return pyotp.TOTP(TOTP_SECRET).now()
+        totp = pyotp.TOTP(TOTP_SECRET)
+        seconds_left = totp.interval - time.time() % totp.interval
+        if seconds_left < 5:        # don't submit a code that expires before Amazon checks it
+            time.sleep(seconds_left + 1)
+        return totp.now()
     if sys.stdin and sys.stdin.isatty():
         return input("Amazon sent a one-time code (OTP) - type it here and press Enter: ").strip()
     raise RunError("Amazon asked for an OTP and there is no AMAZON_ADS_TOTP_SECRET or terminal to type it in. "
@@ -141,9 +157,7 @@ def ensure_signed_in(page: Page) -> None:
                 if "otp" in done:
                     raise RunError("Amazon rejected the OTP")
                 otp_box.fill(_otp_code())
-                remember = page.locator(_OTP_REMEMBER_DEVICE).first
-                if remember.count() and not remember.is_checked():
-                    remember.check()        # "Don't require OTP on this browser"
+                _tick(page.locator(_OTP_REMEMBER_DEVICE).first)     # "Don't require OTP on this browser"
                 _click_first(page, _OTP_SUBMIT)
                 done.update({"otp", "signed_in"})
                 continue
@@ -164,9 +178,7 @@ def ensure_signed_in(page: Page) -> None:
                 if email_box and not email_box.input_value():
                     email_box.fill(EMAIL)
                 password_box.fill(PASSWORD)
-                remember = page.locator(_REMEMBER_ME).first
-                if remember.count() and not remember.is_checked():
-                    remember.check()        # "Keep me signed in"
+                _tick(page.locator(_REMEMBER_ME).first)             # "Keep me signed in"
                 _click_first(page, _SIGN_IN)
                 done.update({"password", "signed_in"})
                 continue
@@ -268,21 +280,73 @@ def run_report(page: Page, name: str, report_id: str, dry_run: bool) -> None:
         return
 
     run_item.click()
-    page.wait_for_timeout(2000)
-    # Some report actions ask to confirm in a dialog.
-    dialog = page.get_by_role("dialog")
-    if dialog.count() and dialog.first.is_visible():
-        confirm = dialog.first.get_by_role("button", name=re.compile(r"^\s*(run|confirm|yes|ok)\b", re.I))
-        if confirm.count():
-            confirm.first.click()
-            page.wait_for_timeout(2000)
+    # Nothing below may raise: a failure after the click would be retried and run the report twice.
+    try:
+        page.wait_for_timeout(2000)
+        # Some report actions ask to confirm in a dialog.
+        dialog = page.get_by_role("dialog")
+        if dialog.count() and dialog.first.is_visible():
+            confirm = dialog.first.get_by_role("button", name=re.compile(r"^\s*(run|confirm|yes|ok)\b", re.I))
+            if confirm.count():
+                confirm.first.click()
+                page.wait_for_timeout(2000)
+    except PlaywrightError as exc:
+        logger.warning("'%s': problem after clicking Run (%s)", name, exc)
 
+    # The row keeps showing the previous run's status until the page is reloaded.
     status = ""
     try:
-        status = " ".join(row.inner_text(timeout=5000).split())
-    except PlaywrightError:
+        page.wait_for_timeout(3000)
+        page.reload(timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        status = " ".join(_report_row(page, name, report_id).inner_text(timeout=15_000).split())
+    except (RunError, PlaywrightError):
         pass
-    logger.info("Ran '%s' - row now reads: %s", name, status or "(row re-rendered)")
+    if re.search(r"processing|queued|in progress|pending", status, re.I):
+        logger.info("Ran '%s' - row now reads: %s", name, status)
+    else:
+        logger.warning("Clicked Run on '%s' but the row does not show it processing yet: %s",
+                       name, status or "(row not found after reload)")
+
+
+def _reopen_reporting_page(page: Page) -> None:
+    try:
+        page.goto(REPORTING_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+    except PlaywrightError as exc:
+        logger.warning("Could not reopen the reporting page: %s", exc)
+
+
+def _with_retries(label: str, step, retry_on, before_retry=None):
+    """Runs step(), retrying up to RETRIES times on the given errors; the last error is raised."""
+    for attempt in range(1, RETRIES + 2):
+        try:
+            return step()
+        except retry_on as exc:
+            if attempt > RETRIES:
+                raise
+            logger.warning("%s failed (attempt %d of %d): %s - retrying in %ds",
+                           label, attempt, RETRIES + 1, exc, RETRY_DELAY_SECONDS)
+            time.sleep(RETRY_DELAY_SECONDS)
+            if before_retry:
+                before_retry()
+
+
+def _acquire_run_lock():
+    """Returns the open lock file, or None if another run holds it. The OS frees the lock when the
+    process ends, even after a crash, so a stale lock file never blocks later runs."""
+    lock_file = open(LOG_DIR / "run.lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
 
 
 def _screenshot(page: Page, label: str) -> None:
@@ -298,15 +362,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     parser.add_argument("--dry-run", action="store_true", help="check each report's Run option without clicking it")
-    parser.add_argument("--report", choices=["auto", "today", "yesterday", "both"], default="auto",
-                        help="which report to run (default: auto, picked by the time in IST)")
+    parser.add_argument("--report", choices=["auto", "today", "yesterday", "both"], default="both",
+                        help="which report to run (default: both; auto picks one by the time in IST)")
     args = parser.parse_args()
 
     LOG_DIR.mkdir(exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         handlers=[logging.StreamHandler(),
                                   logging.FileHandler(LOG_DIR / "run.log", encoding="utf-8")])
-    headless = not args.headed and os.getenv("HEADLESS", "true").lower() != "false"
+    headless = not args.headed and os.getenv("HEADLESS", "true").strip().lower() not in ("false", "0", "no")
+
+    # Two runs at once would clash over browser_profile/, and the first is already running the reports.
+    run_lock = _acquire_run_lock()      # held until the process exits
+    if run_lock is None:
+        logger.warning("Another run is already in progress - exiting without doing anything")
+        return 0
 
     now_ist = datetime.now(IST)
     if args.report == "auto":
@@ -325,17 +395,19 @@ def main() -> int:
         page = context.pages[0] if context.pages else context.new_page()
         page.set_default_timeout(30_000)
         try:
-            ensure_signed_in(page)
+            # Only browser/network errors are retried here: a RunError (wrong password, rejected OTP) would
+            # just fail again and could get the account locked.
+            _with_retries("Sign-in", lambda: ensure_signed_in(page), PlaywrightError)
             for key in keys:
                 name, report_id = REPORTS[key]
                 try:
-                    run_report(page, name, report_id, args.dry_run)
+                    _with_retries(f"'{name}'", lambda: run_report(page, name, report_id, args.dry_run),
+                                  (RunError, PlaywrightError), before_retry=lambda: _reopen_reporting_page(page))
                 except (RunError, PlaywrightError) as exc:
                     logger.error("'%s' failed: %s", name, exc)
                     _screenshot(page, re.sub(r"\W+", "_", name))
                     failed.append(name)
-                    page.goto(REPORTING_URL, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
+                    _reopen_reporting_page(page)        # back to a clean page for the next report
         except (RunError, PlaywrightError) as exc:
             logger.error("Sign-in failed: %s", exc)
             _screenshot(page, "sign_in")
@@ -346,9 +418,16 @@ def main() -> int:
     if failed:
         logger.error("Failed: %s", ", ".join(failed))
         return 1
-    logger.info("Done - %s run; Amazon will email it to the configured recipients", ", ".join(report_names))
+    if args.dry_run:
+        logger.info("Done (dry run) - %s checked, nothing was run", ", ".join(report_names))
+    else:
+        logger.info("Done - %s run; Amazon will email it to the configured recipients", ", ".join(report_names))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:       # e.g. browser not installed, or browser_profile in use by another run
+        logger.exception("Unexpected error")
+        sys.exit(1)
